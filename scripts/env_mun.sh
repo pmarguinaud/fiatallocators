@@ -7,8 +7,10 @@ export OMPI_FC=amdflang         # the Open MPI wrappers call the flang of ROCm 7
 # fypp: pure Python, $HOME/fypp/fypp.py (from pip install fypp) + wrapper $HOME/fypp/bin/fypp,
 # run by the system python3 (no venv/pip on the system Python)
 export PATH=$HOME/fypp/bin:$PATH
-# UCX with HIP VMM support: master 72895c480 + the draft ROCm VMM PRs openucx/ucx#12137, #12138,
-# #12139, #12140 (built for stackdemo). UCX 1.22.0 of the Open MPI module takes HIP VMM memory
+# UCX with HIP VMM support (built for stackdemo): UCX 1.24.0 (development), source
+# /home/marguina/bak1/ucx-vmm/src, branch vmm-series at ff2fb9655 = master 72895c480 + the draft
+# ROCm VMM PRs openucx/ucx#12137 (12d45f12e), #12138 (b6839ad93), #12139 (8be6ca613), #12140
+# (0204c61b4); see README.md. UCX 1.22.0 of the Open MPI module takes HIP VMM memory
 # (DOUBLESTACK_GPU) for host memory and segfaults. Loaded with LD_PRELOAD by the run scripts.
 UCX_VMM=/home/marguina/bak1/ucx-vmm/install
 UCX_PRELOAD=$UCX_VMM/lib/libucs.so.0:$UCX_VMM/lib/libucm.so.0:$UCX_VMM/lib/libuct.so.0:$UCX_VMM/lib/libucp.so.0

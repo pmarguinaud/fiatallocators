@@ -320,6 +320,23 @@ Notes:
   [#12140](https://github.com/openucx/ucx/pull/12140) (`rocm_ipc` of VMM memory through dma-buf),
   in `/home/marguina/bak1/ucx-vmm/install` (built for stackdemo). `FIXED_GPU` and `PEAK_GPU`
   arrays work with either UCX.
+
+  Exact version: UCX 1.24.0 (development), source `/home/marguina/bak1/ucx-vmm/src`, branch
+  `vmm-series` at `ff2fb9655`, which is:
+
+  | Commit | Contents |
+  |---|---|
+  | `72895c480` | base: openucx/ucx master (merge of #12106) |
+  | `12d45f12e` | #12137: UCT/ROCM: Treat `HSA_EXT_POINTER_TYPE_HSA_VMEM` as ROCm memory |
+  | `b6839ad93` | #12138: UCT/ROCM/COPY: Do not access VMM device memory with the CPU |
+  | `8be6ca613` | #12139: UCM/ROCM: Hook the HSA virtual memory map and unmap calls |
+  | `0204c61b4` | #12140: UCT/ROCM/IPC: Share VMM memory through dma-buf file descriptors |
+  | `d70921490`, `ff2fb9655` | merges of the four branches |
+
+  The four PRs are drafts; merged on their common base `72895c480`, as on current master #12139
+  conflicts. Configure options: those of UCX 1.22.0 (`ucx_info -b`). It was built with prefix
+  `/home/marguina/ucx-vmm/install` and moved since (its `.pc` files still give that prefix);
+  preloading the libraries by path works.
 - **`UCX_TLS`.** The Open MPI module loads `openmpi-rt/ucx`, which sets `UCX_TLS=sm,dc_x` (no ROCm
   transport) and `UCX_NET_DEVICES=mlx5_0:1` (fails on MI300A, which has no InfiniBand).
   `run_mpi_mun.sh` sets `UCX_TLS=self,sm,rocm`.

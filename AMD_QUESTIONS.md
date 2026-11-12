@@ -1,7 +1,18 @@
 # AMD port: conclusions and questions
 
-Answer under each **Answer:** line. Round 2 (below) comes first; round 1 follows, with your
-answers.
+Answer under each **Answer:** line. The latest round comes first.
+
+## Round 3 (2026-11-12): your answers applied
+
+| Question | Your answer | Done |
+|---|---|---|
+| Q8 UCX location | keep it; document the exact version | `README.md` (AMD section) and `scripts/env_mun.sh`: UCX 1.24.0 (development), `/home/marguina/bak1/ucx-vmm/src`, branch `vmm-series` at `ff2fb9655` = master `72895c480` + #12137 (`12d45f12e`), #12138 (`b6839ad93`), #12139 (`8be6ca613`), #12140 (`0204c61b4`) |
+| Q9 GEMM shape | good enough | unchanged |
+| Q10 NVIDIA | ask the agent `port-cuda-to-hip-openmp` | message sent with the context and the checks to run on ag (build, ctest, `run_mpi_ag.sh`), on branch `amd-port`; it reports back to session `fiatallocators-a4` |
+| Q11 commit | commit and push | committed on `amd-port` and pushed to `origin` |
+
+No new questions this round. The next step is the NVIDIA check by the agent; I will report its
+results here.
 
 ## Round 2 (2026-11-12): your answers applied
 
@@ -43,6 +54,7 @@ It is in `/home/marguina/bak1/ucx-vmm/install`, but it was built for `/home/marg
 
 **Answer:**
 
+Keep it there, mention the exact version of UCX we have been using in the documentation
 
 #### Q9. GEMM shape in the test graphs
 
@@ -55,6 +67,7 @@ Each graph node is one SGEMM with K = 16 that adds 1 to the array. This keeps th
 
 **Answer:**
 
+Good enough.
 
 #### Q10. NVIDIA
 
@@ -70,6 +83,8 @@ Should I prepare a checklist for that run, or will you do it when you go back to
 
 **Answer:**
 
+You will contact claude agent @port-cuda-to-hip-openmp, send him the context and tell him what to test
+
 
 #### Q11. Commit
 
@@ -80,6 +95,9 @@ the build, the tests and the docs, including this file.
 - Or split it?
 
 **Answer:**
+
+
+commit and push
 
 
 ---
