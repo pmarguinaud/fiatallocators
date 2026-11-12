@@ -2,6 +2,42 @@
 
 Answer under each **Answer:** line. The latest round comes first.
 
+## Round 4 (2026-11-12): NVIDIA check by the agent
+
+Report from `port-cuda-to-hip-openmp` on ag (GH200, nvfortran 26.1, HPC-X 2.25.1, UCX 1.23 preloaded,
+branch `amd-port` at `dfddad9`):
+
+| build | configure | build | ctest | MPI (job 50076527) |
+|---|---|---|---|---|
+| GPU+MPI (cc90) | OK | OK (after fix) | 38/38 | 6/6 |
+| CPU only | OK | OK | 16/16 | not run |
+
+The new check in `test_graph` ("after the capture (nothing run)") passes for the three kinds. The
+`GPU_CREATE`/`GPU_DELETE` interface change (and `PEAK_ENTRY%IDEV`) works on NVIDIA.
+
+Problem found: a clean parallel build once failed with `Unable to open MODULE file
+cuda_graph_mod.mod`. `USE CUDA_GRAPH_MOD` is under `#ifdef _OPENACC`, which the CMake Fortran
+dependency scanner does not see, so `test_graph.F90` could compile before the graph module (same
+risk on AMD with `hip_graph_mod`). Fix (agent's, in `tests/CMakeLists.txt`): the graph module is a
+library `test_graph_mod`, linked to `test_graph` and `test_mpi`, so CMake builds it first.
+
+Fix checked here on AMD (MI210, `build_fix/`):
+
+| check | result |
+|---|---|
+| 3 clean builds `-j 16` | 3/3 OK |
+| ctest (job 9109) | 39/39 |
+| `test_mpi` (job 9110) | 6/6 |
+
+On ag the fix is applied in the working tree of the agent, not committed. Here it is applied in
+the working tree, not committed.
+
+### Q12. Commit the CMake fix?
+
+Commit `tests/CMakeLists.txt` on `amd-port` and push?
+
+**Answer:** commit, merge into main, push (done).
+
 ## Round 3 (2026-11-12): your answers applied
 
 | Question | Your answer | Done |
