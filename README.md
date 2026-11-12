@@ -10,18 +10,18 @@ Fortran allocators for FIAT-based codes, on CPU and on GPU, behind one abstract 
 - **peak**: plain `ALLOCATE`/`DEALLOCATE` of each array. It reports the peak of the memory in use.
 
 Each allocator has a CPU class and a GPU class. The GPU classes run on NVIDIA GPUs (OpenACC, CUDA
-driver API); an AMD version (HIP, OpenMP) is planned.
+driver API) and on AMD GPUs (OpenMP offload, HIP); see [AMD](#amd).
 
 ## Classes
 
 | Class | Memory | Sides, order |
 |---|---|---|
 | `DOUBLESTACK_CPU` | one host buffer of virtual memory (`mmap`, `MAP_NORESERVE`): only the pages touched cost memory | 2 sides, LIFO per side |
-| `DOUBLESTACK_GPU` | range of device addresses (CUDA VMM), physical memory mapped in chunks as each side grows | 2 sides, LIFO per side |
+| `DOUBLESTACK_GPU` | range of device addresses (CUDA or HIP VMM), physical memory mapped in chunks as each side grows | 2 sides, LIFO per side |
 | `FIXED_CPU` | host buffer of `KSIZE` bytes (`ALLOCATE`) | 2 sides, LIFO per side |
-| `FIXED_GPU` | device buffer of `KSIZE` bytes (`acc_malloc`) | 2 sides, LIFO per side |
+| `FIXED_GPU` | device buffer of `KSIZE` bytes (`acc_malloc`, `omp_target_alloc`) | 2 sides, LIFO per side |
 | `PEAK_CPU` | one `ALLOCATE` per array | side ignored, any order |
-| `PEAK_GPU` | one `ALLOCATE` per array, plus its device copy (`acc_create`) | side ignored, any order |
+| `PEAK_GPU` | one `ALLOCATE` per array, plus its device copy (`acc_create`; `omp_target_alloc` + `omp_target_associate_ptr`) | side ignored, any order |
 
 All of them extend the abstract class `ALLOCATOR_BASE`.
 
@@ -138,17 +138,21 @@ offset 0                                                                    SIZE
 - **GPUDirect RDMA.** Chunks are created with `gpuDirectRDMACapable`, so CUDA-aware MPI can
   transfer them directly.
 
-### GPU arrays and OpenACC
+### GPU arrays, OpenACC and OpenMP
 
 - **Host mirror.** The arrays returned by the GPU stack classes are host pointers into a host
   *mirror* of the device buffer. The mirror is virtual memory, untouched unless the program copies
   data to the host.
-- **One mapping.** The whole mirror is declared to OpenACC once (`acc_map_data`). So
-  `PRESENT (X)`, `UPDATE HOST/DEVICE (X)` and `HOST_DATA USE_DEVICE (X)` work for every array.
-- **`PEAK_GPU`.** It creates a device copy of each array (`acc_create`), with the same effect.
+- **One mapping.** The whole mirror is declared to the offload runtime once (`acc_map_data` on
+  NVIDIA, `omp_target_associate_ptr` on AMD). So every array is present on the device:
+  - OpenACC: `PRESENT (X)`, `UPDATE HOST/DEVICE (X)`, `HOST_DATA USE_DEVICE (X)`;
+  - OpenMP: `MAP (PRESENT, ALLOC: X)` (or an implicit map), `TARGET UPDATE FROM/TO (X)`,
+    `TARGET DATA USE_DEVICE_ADDR (X)`.
+- **`PEAK_GPU`.** It creates a device copy of each array (`GPU_CREATE`), with the same effect, and
+  keeps its device address to delete it.
 - **No directives in the classes.** The library classes call the helper module
-  `GPU_HELPERS_MOD` (`gpu_helpers_nvidia.F90`). It holds every CUDA and OpenACC call, through
-  `BIND (C)` interfaces.
+  `GPU_HELPERS_MOD` (`gpu_helpers_nvidia.F90` or `gpu_helpers_amd.F90`, same interface). It holds
+  every CUDA/HIP and OpenACC/OpenMP call, through `BIND (C)` interfaces.
 
 ### Debug mode
 
@@ -163,15 +167,17 @@ They are in `src/allocator_params_mod.F90`; change them and recompile.
 | Parameter | Default | |
 |---|---|---|
 | `ALLOC_ALIGNMENT` | 128 bytes | alignment of every array (stack-based classes), power of 2 |
-| `VMM_CHUNK` | 64 MiB | mapping unit of `DOUBLESTACK_GPU`, multiple of the VMM granularity (2 MiB) |
+| `VMM_CHUNK` | 64 MiB | mapping unit of `DOUBLESTACK_GPU`, multiple of the VMM granularity (2 MiB on NVIDIA, 4 KiB on AMD) |
 | `DEBUG_FILL_BYTE` | 255 | fill byte of the debug mode |
 
 ## Requirements
 
-- **Compiler.** nvfortran (NVIDIA HPC SDK); CMake ≥ 3.18; [fypp](https://github.com/aradi/fypp)
-  generates the type/kind/rank variants.
-- **GPU classes.** OpenACC, and `libcuda` (driver API) and `libcudart` (graph tests).
-- **MPI test.** A CUDA-aware MPI.
+- **Compiler.** nvfortran (NVIDIA HPC SDK) or amdflang (AMD; tested: AFAR 24.3.0); CMake ≥ 3.18;
+  [fypp](https://github.com/aradi/fypp) generates the type/kind/rank variants.
+- **GPU classes, NVIDIA.** OpenACC, and `libcuda` (driver API) and `libcudart` (graph tests).
+- **GPU classes, AMD.** OpenMP offload, `libamdhip64` (HIP VMM API); a GPU with VMM support
+  (checked at initialisation).
+- **MPI test.** A GPU-aware MPI.
 - **MPI on `DOUBLESTACK_GPU` arrays that cross chunk boundaries, between nodes.** An array may span
   two physical allocations, so MPI must register the exact range:
   - registration of GPU memory through DMA-BUF: NVIDIA open GPU kernel modules, Linux ≥ 5.12,
@@ -185,6 +191,8 @@ They are in `src/allocator_params_mod.F90`; change them and recompile.
 
 ## Build
 
+NVIDIA:
+
 ```sh
 source scripts/env_ag.sh       # ECMWF ag (GH200): NVHPC 26.1, HPC-X, CMake, fypp; adapt elsewhere
 cmake -S . -B build_gpu -DCMAKE_Fortran_COMPILER=nvfortran \
@@ -192,12 +200,22 @@ cmake -S . -B build_gpu -DCMAKE_Fortran_COMPILER=nvfortran \
 cmake --build build_gpu -j 8
 ```
 
+AMD:
+
+```sh
+source scripts/env_mun.sh      # AMD cluster: AFAR 24.3.0, its Open MPI, CMake, fypp; adapt elsewhere
+cmake -S . -B build_amd -DCMAKE_Fortran_COMPILER=amdflang -DCMAKE_C_COMPILER=amdclang \
+      -DENABLE_GPU=ON -DENABLE_MPI=ON -DGPU_ARCH=gfx90a
+cmake --build build_amd -j 16
+```
+
 | CMake option | Default | |
 |---|---|---|
-| `ENABLE_GPU` | `OFF` | build the GPU classes (otherwise CPU only, no OpenACC needed) |
+| `ENABLE_GPU` | `OFF` | build the GPU classes (otherwise CPU only, no offload flags) |
 | `ENABLE_MPI` | `OFF` | build the MPI test |
-| `GPU_CC` | `cc90` | `-gpu=` target: `cc80` for A100, `cc90` for GH200 |
-| `GPU_VENDOR` | `nvidia` | helper set (`src/gpu_helpers_<vendor>.F90`) |
+| `GPU_VENDOR` | from the compiler | helper set (`src/gpu_helpers_<vendor>.F90`): `nvidia` (nvfortran) or `amd` (amdflang) |
+| `GPU_CC` | `cc90` | NVIDIA, `-gpu=` target: `cc80` for A100, `cc90` for GH200 |
+| `GPU_ARCH` | `gfx90a` | AMD, `--offload-arch=` target: `gfx90a` for MI210/MI250, `gfx942` for MI300A/MI300X; `gfx90a,gfx942` for both |
 
 Link applications with the `fiatallocators` library. Its modules are in `<build>/modules`.
 
@@ -215,9 +233,12 @@ allocator, through `NEW_ALLOCATOR`.
 | `test_debug` | doublestack, fixed | freed memory reads NaN in debug mode |
 | `test_peak` | all | `PEAK_USED` is 40 MiB for a known sequence |
 | `test_fixed_full` | fixed | a full buffer aborts (expected failure) |
-| `test_acc` (GPU) | all | OpenACC kernels on arrays crossing chunks, both sides; `HOST_DATA USE_DEVICE` |
-| `test_graph` (GPU) | all | OpenACC kernels captured once into a CUDA graph, replayed before and after the allocator grows (peak: only while the arrays stay allocated, since they may move) |
+| `test_offload` (GPU) | all | OpenACC or OpenMP kernels on arrays crossing chunks, both sides; `HOST_DATA USE_DEVICE` / `USE_DEVICE_ADDR` |
+| `test_graph` (GPU) | all | `A = A + 1`, `B = B + 1` captured once into a graph (NVIDIA: OpenACC kernels, CUDA graph; AMD: hipBLAS SGEMMs, HIP graph), nothing run during the capture, replayed before and after the allocator grows (peak: only while the arrays stay allocated, since they may move) |
+| `hip_vmm_layout` (GPU, AMD) | | the `BIND (C)` copies of the HIP structures and constants match the ROCm headers |
 | `test_mpi` | all | 2 ranks: graph replays and `MPI_Sendrecv` of arrays crossing chunks (lower and upper side), before and after growth |
+
+The GPU tests hold both sets of directives: OpenACC under `#ifdef _OPENACC`, OpenMP otherwise.
 
 Run the single-process tests (CPU, and GPU when built with it) with:
 
@@ -234,6 +255,13 @@ sbatch scripts/run_mpi_ag.sh          # output: test_mpi_<jobid>.out
 The script loads UCX `v1.23.x` (`/perm/sor/install/ucx-test/aarch64/ucx-v1.23.x`) with
 `LD_PRELOAD`, in place of the UCX of HPC-X. It also runs `mpirun --bind-to none`, which ag needs.
 
+On the AMD cluster (one node per partition, so both ranks share a node):
+
+```sh
+sbatch [-p MI250|MI300A|MI300X] scripts/run_ctest_mun.sh build_amd   # ctest on one GPU
+sbatch [-p MI250|MI300A|MI300X] scripts/run_mpi_mun.sh build_amd     # test_mpi, 2 GPUs
+```
+
 ## Files
 
 | File | Contents |
@@ -246,21 +274,54 @@ The script loads UCX `v1.23.x` (`/perm/sor/install/ucx-test/aarch64/ucx-v1.23.x`
 | `src/peak_cpu_mod.F90`, `src/peak_gpu_mod.F90` | peak allocators |
 | `src/new_allocator_mod.F90` | factory |
 | `src/gpu_helpers_nvidia.F90` | NVIDIA helpers: CUDA driver VMM API, OpenACC runtime |
+| `src/gpu_helpers_amd.F90` | AMD helpers: HIP VMM API, OpenMP offload runtime |
 | `src/host_helpers_mod.F90` | libc helpers: `mmap`, `munmap`, `sysconf`, `memset` |
 | `src/allocator_params_mod.F90` | tunable parameters, side constants |
 | `src/abor1.F90`, `src/abor1.intfb.h` | `ABOR1` |
 | `src/parkind1.F90` | copy of FIAT's `PARKIND1` |
-| `tests/` | tests; `cuda_graph_mod.F90`: CUDA graph helpers for the tests |
+| `tests/` | tests; `cuda_graph_mod.F90`, `hip_graph_mod.F90`: CUDA and HIP graph helpers for the tests; `c/hip_vmm_layout.c`: HIP layout check |
 | `scripts/env_ag.sh`, `scripts/run_mpi_ag.sh` | environment and MPI job for ECMWF ag |
+| `scripts/env_mun.sh`, `scripts/run_ctest_mun.sh`, `scripts/run_mpi_mun.sh` | environment, ctest and MPI jobs for the AMD cluster |
 
-## AMD (planned)
+## AMD
 
-The AMD version will provide `src/gpu_helpers_amd.F90`, a module with the same name and public
-routines as the NVIDIA one:
-- HIP VMM calls in place of the CUDA ones;
-- OpenMP in place of OpenACC: `omp_target_associate_ptr` in place of `acc_map_data`,
-  `omp_target_alloc` in place of `acc_malloc`.
+The AMD version is `src/gpu_helpers_amd.F90`: a module with the same name and public routines as
+the NVIDIA one, selected by `GPU_VENDOR`. It uses the HIP VMM API, and OpenMP in place of OpenACC
+(`omp_target_associate_ptr` in place of `acc_map_data`, `omp_target_alloc` in place of
+`acc_malloc`). `GPU_CREATE` returns the device address of the copy, and `GPU_DELETE` takes it,
+since OpenMP has no `acc_create`/`acc_delete`.
 
-The GPU tests will need OpenMP versions of their directives, and HIP graphs in place of
-`cuda_graph_mod.F90`. One choice is still open: two helper modules selected by `GPU_VENDOR`, or
-one module with `#ifdef`.
+Status (AFAR 24.3.0 with its HIP and hipBLAS, Open MPI 5.0.11, UCX with HIP VMM support, see
+below):
+
+| | MI210 | MI250 | MI300A | MI300X |
+|---|---|---|---|---|
+| ctest (39 tests, CPU and GPU) | passed | passed | passed | passed |
+| `test_mpi`, CPU and GPU, all allocators | passed | passed | passed | passed |
+
+`test_mpi` runs on one node (each partition has one): GPU to GPU through UCX `rocm_ipc`. Between
+nodes (RDMA registration of a range spanning two physical allocations) is not tested.
+
+Notes:
+
+- **Graphs hold hipBLAS calls.** The OpenMP runtime launches kernels on HSA queues, not HIP
+  streams: a HIP stream capture records none of them (0 nodes), and
+  `!$omp interop init (targetsync: ...)` returns `omp_interop_none`. hipBLAS calls on a HIP stream
+  can be captured, as in ecTrans: on AMD, `test_graph` and `test_mpi` capture `X = X + 1` as an
+  SGEMM, `X (M, N) += U (M, K) * V (K, N)` with `U (:, 1) = 1`, `U (:, 2:) = 0`, `V = 1`
+  (`tests/hip_graph_mod.F90`).
+- **UCX.** UCX 1.22.0 (the Open MPI module) takes HIP VMM memory (`hipMemCreate` + `hipMemMap`)
+  for host memory, and segfaults in `uct_mm_ep_am_bcopy` → `ucs_x86_nt_buffer_transfer` on
+  `DOUBLESTACK_GPU` arrays. `scripts/run_mpi_mun.sh` preloads a UCX built from master `72895c480`
+  plus the draft ROCm VMM pull requests
+  [#12137](https://github.com/openucx/ucx/pull/12137) (memory-type detection of VMM memory),
+  [#12138](https://github.com/openucx/ucx/pull/12138) (no CPU copy of VMM memory),
+  [#12139](https://github.com/openucx/ucx/pull/12139) (UCM hooks on VMM map/unmap) and
+  [#12140](https://github.com/openucx/ucx/pull/12140) (`rocm_ipc` of VMM memory through dma-buf),
+  in `/home/marguina/bak1/ucx-vmm/install` (built for stackdemo). `FIXED_GPU` and `PEAK_GPU`
+  arrays work with either UCX.
+- **`UCX_TLS`.** The Open MPI module loads `openmpi-rt/ucx`, which sets `UCX_TLS=sm,dc_x` (no ROCm
+  transport) and `UCX_NET_DEVICES=mlx5_0:1` (fails on MI300A, which has no InfiniBand).
+  `run_mpi_mun.sh` sets `UCX_TLS=self,sm,rocm`.
+- **`GPU_MEMSET`** (debug mode) synchronises HIP only: OpenMP target regions without `NOWAIT` are
+  complete when they return.

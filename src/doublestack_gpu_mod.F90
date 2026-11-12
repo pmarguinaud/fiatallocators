@@ -1,7 +1,7 @@
 MODULE DOUBLESTACK_GPU_MOD
 
-! DOUBLESTACK_GPU: double stack on a range of device virtual addresses (CUDA VMM on NVIDIA; HIP
-! on AMD later, through the same GPU_HELPERS_MOD interface).
+! DOUBLESTACK_GPU: double stack on a range of device virtual addresses (CUDA VMM on NVIDIA, HIP
+! VMM on AMD, through the same GPU_HELPERS_MOD interface).
 !
 ! INIT reserves KSIZE bytes of device addresses (0 = device memory size), rounded down to a
 ! multiple of VMM_CHUNK; this uses no memory. Physical memory is mapped VMM_CHUNK bytes at a time
@@ -10,8 +10,9 @@ MODULE DOUBLESTACK_GPU_MOD
 ! is mapped only up to the high-water mark of each side. DESTROY unmaps everything.
 !
 ! The arrays are host pointers into a host mirror of the range (virtual memory, not touched unless
-! the program copies data to the host), declared once to the offload runtime (acc_map_data), so
-! that PRESENT (X), UPDATE and HOST_DATA USE_DEVICE work on every array of the stack.
+! the program copies data to the host), declared once to the offload runtime (acc_map_data or
+! omp_target_associate_ptr), so that PRESENT (X), UPDATE and HOST_DATA USE_DEVICE (OpenMP:
+! MAP (PRESENT), TARGET UPDATE, USE_DEVICE_ADDR) work on every array of the stack.
 
 USE ISO_C_BINDING
 USE ISO_FORTRAN_ENV, ONLY : OUTPUT_UNIT

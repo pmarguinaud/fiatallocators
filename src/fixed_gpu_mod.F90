@@ -1,7 +1,7 @@
 MODULE FIXED_GPU_MOD
 
 ! FIXED_GPU: double stack in a device buffer of fixed size, allocated at once by INIT (acc_malloc
-! on NVIDIA; omp_target_alloc on AMD later). KSIZE: size of the buffer in bytes (> 0). An
+! on NVIDIA, omp_target_alloc on AMD). KSIZE: size of the buffer in bytes (> 0). An
 ! allocation that does not fit aborts. DESTROY prints the buffer size and the peak actually used.
 ! As DOUBLESTACK_GPU, the arrays are host pointers into a host mirror mapped to the buffer.
 

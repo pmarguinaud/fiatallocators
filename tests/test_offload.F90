@@ -1,11 +1,16 @@
-PROGRAM TEST_ACC
+PROGRAM TEST_OFFLOAD
 
-! Test d (GPU): OpenACC kernels on arrays of the allocator, on both sides, with arrays large enough
+! Test d (GPU): offload kernels on arrays of the allocator, on both sides, with arrays large enough
 ! to cross VMM chunk boundaries (DOUBLESTACK_GPU). PRESENT, UPDATE HOST and HOST_DATA USE_DEVICE
-! are used on the arrays; a second round reuses the freed memory.
+! (OpenACC), or MAP (PRESENT), TARGET UPDATE FROM and USE_DEVICE_ADDR (OpenMP), are used on the
+! arrays; a second round reuses the freed memory.
 
 USE ISO_C_BINDING
+#ifdef _OPENACC
 USE OPENACC
+#else
+USE OMP_LIB
+#endif
 USE PARKIND1, ONLY : JPIM, JPRM, JPRD
 USE ALLOCATOR_BASE_MOD, ONLY : ALLOCATOR_BASE, SIDE_LOWER, SIDE_UPPER
 USE TEST_UTIL_MOD, ONLY : TEST_SETUP, CHECK, TEST_END
@@ -25,8 +30,8 @@ INTEGER (KIND=JPIM), PARAMETER :: NC = 9000000                 ! ZC: 69 MiB, upp
 LOGICAL :: LLDEV
 TYPE (C_PTR) :: YLHOST, YLDEV
 
-CALL TEST_SETUP ('test_acc', YLALLOC, CLKIND, LLGPU)
-IF (.NOT. LLGPU) CALL CHECK (.FALSE., 'test_acc is a GPU test')
+CALL TEST_SETUP ('test_offload', YLALLOC, CLKIND, LLGPU)
+IF (.NOT. LLGPU) CALL CHECK (.FALSE., 'test_offload is a GPU test')
 
 DO JROUND = 1, 2
   CALL YLALLOC%ALLOCATE (ZA, [N1, N2])
@@ -34,36 +39,67 @@ DO JROUND = 1, 2
   CALL YLALLOC%ALLOCATE (ZC, [NC], KSIDE=SIDE_UPPER)
   CALL YLALLOC%ALLOCATE (IX, [1000], LBOUNDS=[0], KSIDE=SIDE_UPPER)
 
+#ifdef _OPENACC
   CALL CHECK (ACC_IS_PRESENT (ZB) .AND. ACC_IS_PRESENT (ZC), 'arrays present on the device')
+#else
+  CALL CHECK (OMP_TARGET_IS_PRESENT (C_LOC (ZB), OMP_GET_DEFAULT_DEVICE ()) /= 0 .AND. &
+            & OMP_TARGET_IS_PRESENT (C_LOC (ZC), OMP_GET_DEFAULT_DEVICE ()) /= 0, 'arrays present on the device')
+#endif
 
+#ifdef _OPENACC
   !$ACC PARALLEL LOOP COLLAPSE (2) PRESENT (ZA)
+#else
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE (2) MAP (PRESENT, ALLOC: ZA)
+#endif
   DO K = 1, N2
     DO J = 1, N1
       ZA (J, K) = REAL (J + K, JPRD) + JROUND
     ENDDO
   ENDDO
+#ifdef _OPENACC
   !$ACC PARALLEL LOOP PRESENT (ZB)
+#else
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO MAP (PRESENT, ALLOC: ZB)
+#endif
   DO J = 1, NB
     ZB (J) = REAL (MOD (J, 1000), JPRM) + JROUND
   ENDDO
+#ifdef _OPENACC
   !$ACC PARALLEL LOOP PRESENT (ZA, ZC)
+#else
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO MAP (PRESENT, ALLOC: ZA, ZC)
+#endif
   DO J = 1, NC
     ZC (J) = 2 * ZA (MOD (J - 1, N1) + 1, 1)
   ENDDO
+#ifdef _OPENACC
   !$ACC PARALLEL LOOP PRESENT (IX)
+#else
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO MAP (PRESENT, ALLOC: IX)
+#endif
   DO J = 0, 999
     IX (J) = J * JROUND
   ENDDO
 
-  ! The device address seen by HOST_DATA is not the host address of the mirror
+  ! The device address seen by HOST_DATA / USE_DEVICE_ADDR is not the host address of the mirror
   YLHOST = C_LOC (ZB)
+#ifdef _OPENACC
   !$ACC HOST_DATA USE_DEVICE (ZB)
   YLDEV = C_LOC (ZB)
   !$ACC END HOST_DATA
+#else
+  !$OMP TARGET DATA USE_DEVICE_ADDR (ZB)
+  YLDEV = C_LOC (ZB)
+  !$OMP END TARGET DATA
+#endif
   LLDEV = .NOT. C_ASSOCIATED (YLHOST, YLDEV)
-  CALL CHECK (LLDEV, 'HOST_DATA USE_DEVICE gives the device address')
+  CALL CHECK (LLDEV, 'HOST_DATA USE_DEVICE / USE_DEVICE_ADDR gives the device address')
 
+#ifdef _OPENACC
   !$ACC UPDATE HOST (ZA, ZB, ZC, IX)
+#else
+  !$OMP TARGET UPDATE FROM (ZA, ZB, ZC, IX)
+#endif
   CALL CHECK (ZA (7, 11) == 18 + JROUND .AND. ZA (N1, N2) == N1 + N2 + JROUND, 'kernel on ZA')
   CALL CHECK (ALL (ZB (1:NB:997) == REAL (MOD ([(J, J = 1, NB, 997)], 1000), JPRM) + JROUND), 'kernel on ZB')
   CALL CHECK (ZC (1) == 2 * (2 + JROUND) .AND. ZC (NC) == 2 * ZA (MOD (NC - 1, N1) + 1, 1), 'kernel on ZC')
@@ -77,4 +113,4 @@ ENDDO
 
 CALL TEST_END (YLALLOC)
 
-END PROGRAM TEST_ACC
+END PROGRAM TEST_OFFLOAD

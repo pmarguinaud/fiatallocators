@@ -60,13 +60,21 @@ IF (LLGPU) THEN
   ! Host -> device, clear the host copy, device -> host
 #:for t, k, s in types
 #:for r in ranks
+#ifdef _OPENACC
   !$ACC UPDATE DEVICE (X_${s}$_${r}$)
+#else
+  !$OMP TARGET UPDATE TO (X_${s}$_${r}$)
+#endif
 #:if t == 'LOGICAL'
   X_${s}$_${r}$ = .FALSE.
 #:else
   X_${s}$_${r}$ = 0
 #:endif
+#ifdef _OPENACC
   !$ACC UPDATE HOST (X_${s}$_${r}$)
+#else
+  !$OMP TARGET UPDATE FROM (X_${s}$_${r}$)
+#endif
 #:endfor
 #:endfor
 ENDIF

@@ -20,13 +20,21 @@ CALL TEST_SETUP ('test_debug', YLALLOC, CLKIND, LLGPU, LDDEBUG=.TRUE.)
 CALL YLALLOC%ALLOCATE (Z, [1000])
 Z = 1.0_JPRD
 IF (LLGPU) THEN
+#ifdef _OPENACC
   !$ACC UPDATE DEVICE (Z)
+#else
+  !$OMP TARGET UPDATE TO (Z)
+#endif
 ENDIF
 ZSTALE => Z
 CALL YLALLOC%DEALLOCATE (Z)
 ! The memory is still mapped (stack-based allocators): read it back
 IF (LLGPU) THEN
+#ifdef _OPENACC
   !$ACC UPDATE HOST (ZSTALE)
+#else
+  !$OMP TARGET UPDATE FROM (ZSTALE)
+#endif
 ENDIF
 CALL CHECK (ALL (IEEE_IS_NAN (ZSTALE)), 'freed memory filled (NaN)')
 

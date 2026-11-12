@@ -16,7 +16,9 @@ MODULE GPU_HELPERS_MOD
 !   GPU_MALLOC (KBYTES), GPU_FREE (KDEV)       plain device memory (acc_malloc / acc_free)
 !   GPU_MAP_DATA (KHOST, KDEV, KBYTES)         declare host range -> device range (acc_map_data)
 !   GPU_UNMAP_DATA (KHOST)                     (acc_unmap_data)
-!   GPU_CREATE (KHOST, KBYTES), GPU_DELETE (KHOST, KBYTES)   device copy (acc_create / acc_delete)
+!   KDEV = GPU_CREATE (KHOST, KBYTES)          device copy of a host array (acc_create); returns
+!                                              its address
+!   GPU_DELETE (KHOST, KDEV, KBYTES)           (acc_delete)
 !   GPU_MEMSET (KDEV, KBYTE, KBYTES)           fill device memory, synchronous
 
 USE ISO_C_BINDING
@@ -316,21 +318,22 @@ CALL ACC_UNMAP_DATA_C (TRANSFER (KHOST, C_NULL_PTR))
 
 END SUBROUTINE GPU_UNMAP_DATA
 
-SUBROUTINE GPU_CREATE (KHOST, KBYTES)
+FUNCTION GPU_CREATE (KHOST, KBYTES) RESULT (KDEV)
 
 INTEGER (KIND=C_INTPTR_T), INTENT (IN) :: KHOST
 INTEGER (KIND=JPIB), INTENT (IN) :: KBYTES
-
-TYPE (C_PTR) :: P
+INTEGER (KIND=C_INTPTR_T) :: KDEV
 
 CALL GPU_INIT
-P = ACC_CREATE_C (TRANSFER (KHOST, C_NULL_PTR), INT (KBYTES, C_SIZE_T))
+KDEV = TRANSFER (ACC_CREATE_C (TRANSFER (KHOST, C_NULL_PTR), INT (KBYTES, C_SIZE_T)), KDEV)
 
-END SUBROUTINE GPU_CREATE
+END FUNCTION GPU_CREATE
 
-SUBROUTINE GPU_DELETE (KHOST, KBYTES)
+SUBROUTINE GPU_DELETE (KHOST, KDEV, KBYTES)
 
-INTEGER (KIND=C_INTPTR_T), INTENT (IN) :: KHOST
+! KDEV is not needed by acc_delete; it is in the interface for the AMD version
+
+INTEGER (KIND=C_INTPTR_T), INTENT (IN) :: KHOST, KDEV
 INTEGER (KIND=JPIB), INTENT (IN) :: KBYTES
 
 CALL ACC_DELETE_C (TRANSFER (KHOST, C_NULL_PTR), INT (KBYTES, C_SIZE_T))

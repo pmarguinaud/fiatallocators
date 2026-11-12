@@ -3,20 +3,28 @@ PROGRAM TEST_MPI
 ! Test f (MPI, 2 ranks, one GPU each): as stackdemo, with every allocator.
 !   1. A, B on the lower side, R on the upper side. With DOUBLESTACK_GPU, B and R cross chunk
 !      boundaries (each spans two physical allocations).
-!   2. GPU: two kernels (A = A + 1, B = B + 1) captured once into a CUDA graph, replayed twice.
-!      CPU: the same updates on the host.
+!   2. GPU: A = A + 1, B = B + 1 captured once into a graph, replayed twice. NVIDIA: two OpenACC
+!      kernels in a CUDA graph. AMD: two hipBLAS SGEMMs in a HIP graph (HIP_GRAPH_MOD; OpenMP
+!      target regions cannot be captured). CPU: the same updates on the host.
 !   3. Each rank sends B to the other one, which receives it in R (GPU: device addresses,
-!      HOST_DATA USE_DEVICE, CUDA-aware MPI). Values checked.
+!      HOST_DATA USE_DEVICE or USE_DEVICE_ADDR, GPU-aware MPI). Values checked.
 !   4. The allocator grows: G (lower), then R2 (upper, crossing another boundary). Not for 'peak'.
 !   5. Graph replayed 3 more times, B exchanged into R2, values checked.
 ! Usage: mpirun -n 2 test_mpi <doublestack|fixed|peak> <cpu|gpu>
 
+#ifdef _OPENACC
 USE OPENACC
+#elif defined(_OPENMP)
+USE OMP_LIB
+#endif
 USE PARKIND1, ONLY : JPIM, JPIB, JPRM
 USE ALLOCATOR_BASE_MOD, ONLY : ALLOCATOR_BASE, SIDE_LOWER, SIDE_UPPER
 USE TEST_UTIL_MOD, ONLY : TEST_SETUP, CHECK, TEST_END, NFAIL
-#ifdef WITH_GPU
+#if defined(WITH_GPU) && defined(_OPENACC)
 USE CUDA_GRAPH_MOD, ONLY : GRAPH_BEGIN, GRAPH_END, GRAPH_LAUNCH, GRAPH_SYNC, GRAPH_DESTROY
+#elif defined(WITH_GPU)
+USE HIP_GRAPH_MOD, ONLY : GRAPH_BEGIN, GRAPH_ADD_ONE, GRAPH_END, GRAPH_LAUNCH, GRAPH_SYNC, &
+                        & GRAPH_DESTROY, GRAPH_ONES, GEMM_M, GEMM_K
 #endif
 
 IMPLICIT NONE
@@ -32,6 +40,7 @@ INTEGER, PARAMETER :: IQ = 1
 INTEGER (KIND=JPIM), PARAMETER :: NA = 4000000                 ! 15 MiB
 INTEGER (KIND=JPIM), PARAMETER :: NB = 20000000                ! 76 MiB: B, R, G, R2
 REAL (KIND=JPRM), POINTER :: A (:), B (:), R (:), G (:), R2 (:)
+REAL (KIND=JPRM), POINTER :: U (:,:), V (:,:)                  ! SGEMM operands (AMD)
 INTEGER :: IRANK, ISIZE, IPEER, ILOCAL, IERR, INODES, IREP, NREP, NBADALL
 INTEGER (KIND=JPIM) :: J
 
@@ -45,8 +54,10 @@ IPEER = 1 - IRANK
 CALL GET_ENVIRONMENT_VARIABLE ('OMPI_COMM_WORLD_LOCAL_RANK', CLLOCAL)
 ILOCAL = 0
 IF (CLLOCAL /= '') READ (CLLOCAL, *) ILOCAL
-#ifdef WITH_GPU
+#if defined(WITH_GPU) && defined(_OPENACC)
 CALL ACC_SET_DEVICE_NUM (MOD (ILOCAL, ACC_GET_NUM_DEVICES (ACC_DEVICE_NVIDIA)), ACC_DEVICE_NVIDIA)
+#elif defined(WITH_GPU) && defined(_OPENMP)
+CALL OMP_SET_DEFAULT_DEVICE (MOD (ILOCAL, OMP_GET_NUM_DEVICES ()))
 #endif
 
 CALL TEST_SETUP ('test_mpi', YLALLOC, CLKIND, LLGPU, KSIZE=512_JPIB * 1024_JPIB * 1024_JPIB, &
@@ -61,11 +72,15 @@ DO J = 1, NB
   B (J) = REAL (MOD (J, 1000) + 1000 * IRANK)
 ENDDO
 IF (LLGPU) THEN
+#ifdef _OPENACC
   !$ACC UPDATE DEVICE (A, B)
+#else
+  !$OMP TARGET UPDATE TO (A, B)
+#endif
 ENDIF
 
 CALL SAY ('=== 2. capture A = A + 1, B = B + 1; replay twice')
-#ifdef WITH_GPU
+#if defined(WITH_GPU) && defined(_OPENACC)
 IF (LLGPU) THEN
   CALL GRAPH_BEGIN (IQ)
   !$ACC PARALLEL LOOP PRESENT (A) ASYNC (IQ)
@@ -78,6 +93,17 @@ IF (LLGPU) THEN
   ENDDO
   CALL GRAPH_END (INODES)
   CALL CHECK (INODES == 2, 'graph of 2 kernels')
+ENDIF
+#elif defined(WITH_GPU)
+IF (LLGPU) THEN
+  CALL YLALLOC%ALLOCATE (U, [GEMM_M, GEMM_K])
+  CALL YLALLOC%ALLOCATE (V, [GEMM_K, NB / GEMM_M])
+  CALL GRAPH_ONES (U, V)
+  CALL GRAPH_BEGIN
+  CALL GRAPH_ADD_ONE (A, U, V)
+  CALL GRAPH_ADD_ONE (B, U, V)
+  CALL GRAPH_END (INODES)
+  CALL CHECK (INODES == 2, 'graph of 2 SGEMMs')
 ENDIF
 #endif
 NREP = 0
@@ -101,6 +127,10 @@ ENDIF
 
 #ifdef WITH_GPU
 IF (LLGPU) CALL GRAPH_DESTROY
+#ifndef _OPENACC
+IF (LLGPU) CALL YLALLOC%DEALLOCATE (V)
+IF (LLGPU) CALL YLALLOC%DEALLOCATE (U)
+#endif
 #endif
 CALL YLALLOC%DEALLOCATE (R)
 CALL YLALLOC%DEALLOCATE (B)
@@ -143,10 +173,17 @@ INTEGER (KIND=JPIM), INTENT (IN) :: N
 REAL (KIND=JPRM) :: S (N), RR (N)
 
 IF (LLGPU) THEN
+#ifdef _OPENACC
   !$ACC HOST_DATA USE_DEVICE (S, RR)
   CALL MPI_SENDRECV (S, N, MPI_REAL, IPEER, 1, RR, N, MPI_REAL, IPEER, 1, MPI_COMM_WORLD, &
                    & MPI_STATUS_IGNORE, IERR)
   !$ACC END HOST_DATA
+#else
+  !$OMP TARGET DATA USE_DEVICE_ADDR (S, RR)
+  CALL MPI_SENDRECV (S, N, MPI_REAL, IPEER, 1, RR, N, MPI_REAL, IPEER, 1, MPI_COMM_WORLD, &
+                   & MPI_STATUS_IGNORE, IERR)
+  !$OMP END TARGET DATA
+#endif
 ELSE
   CALL MPI_SENDRECV (S, N, MPI_REAL, IPEER, 1, RR, N, MPI_REAL, IPEER, 1, MPI_COMM_WORLD, &
                    & MPI_STATUS_IGNORE, IERR)
@@ -164,7 +201,11 @@ REAL (KIND=JPRM), POINTER, INTENT (IN) :: RR (:)
 INTEGER (KIND=JPIM) :: IBAD
 
 IF (LLGPU) THEN
+#ifdef _OPENACC
   !$ACC UPDATE HOST (A, RR)
+#else
+  !$OMP TARGET UPDATE FROM (A, RR)
+#endif
 ENDIF
 CALL CHECK (ALL (A == REAL (NREP)), 'A '//CDWHEN)
 IBAD = 0
