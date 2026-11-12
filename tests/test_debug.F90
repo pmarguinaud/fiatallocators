@@ -1,0 +1,35 @@
+PROGRAM TEST_DEBUG
+
+! Debug mode (LDDEBUG): freed memory is filled with 0xFF, so a stale access to a freed REAL array
+! reads NaN. Stack-based allocators (doublestack, fixed); on GPU the device copy is checked.
+
+USE, INTRINSIC :: IEEE_ARITHMETIC, ONLY : IEEE_IS_NAN
+USE PARKIND1, ONLY : JPRD
+USE ALLOCATOR_BASE_MOD, ONLY : ALLOCATOR_BASE
+USE TEST_UTIL_MOD, ONLY : TEST_SETUP, CHECK, TEST_END
+
+IMPLICIT NONE
+
+CLASS (ALLOCATOR_BASE), POINTER :: YLALLOC
+CHARACTER (LEN=16) :: CLKIND
+LOGICAL :: LLGPU
+REAL (KIND=JPRD), POINTER :: Z (:), ZSTALE (:)
+
+CALL TEST_SETUP ('test_debug', YLALLOC, CLKIND, LLGPU, LDDEBUG=.TRUE.)
+
+CALL YLALLOC%ALLOCATE (Z, [1000])
+Z = 1.0_JPRD
+IF (LLGPU) THEN
+  !$ACC UPDATE DEVICE (Z)
+ENDIF
+ZSTALE => Z
+CALL YLALLOC%DEALLOCATE (Z)
+! The memory is still mapped (stack-based allocators): read it back
+IF (LLGPU) THEN
+  !$ACC UPDATE HOST (ZSTALE)
+ENDIF
+CALL CHECK (ALL (IEEE_IS_NAN (ZSTALE)), 'freed memory filled (NaN)')
+
+CALL TEST_END (YLALLOC)
+
+END PROGRAM TEST_DEBUG

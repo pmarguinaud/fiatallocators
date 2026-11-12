@@ -1,0 +1,91 @@
+#:set ranks = [1, 2, 3, 4, 5]
+#:set types = [('INTEGER', 'JPIM', 'IM'), ('INTEGER', 'JPIB', 'IB'), ('REAL', 'JPRM', 'RM'), ('REAL', 'JPRD', 'RD'), ('LOGICAL', 'JPLM', 'LM')]
+#:def colons(r)
+${','.join([':'] * r)}$
+#:enddef
+#:def value(t, k)
+#:if t == 'LOGICAL'
+MOD (I, 3) == 0
+#:elif t == 'INTEGER'
+INT (I, ${k}$)
+#:else
+REAL (I, ${k}$)
+#:endif
+#:enddef
+#:def same(t)
+${'.EQV.' if t == 'LOGICAL' else '=='}$
+#:enddef
+PROGRAM TEST_TYPES
+
+! Test a: every type/kind/rank, with lower and upper bounds, and a zero-size array. All 25 arrays
+! are live at the same time (alternately on the lower and upper side), then freed in reverse
+! order. Values are written and read back; on GPU they go to the device and back.
+
+USE PARKIND1, ONLY : JPIM, JPIB, JPRM, JPRD, JPLM
+USE ALLOCATOR_BASE_MOD, ONLY : ALLOCATOR_BASE, SIDE_LOWER, SIDE_UPPER
+USE TEST_UTIL_MOD, ONLY : TEST_SETUP, CHECK, TEST_END
+
+IMPLICIT NONE
+
+CLASS (ALLOCATOR_BASE), POINTER :: YLALLOC
+CHARACTER (LEN=16) :: CLKIND
+LOGICAL :: LLGPU
+INTEGER (KIND=JPIM), PARAMETER :: IUB (5) = [3, 4, 5, 2, 3], ILB (5) = [-1, 0, 2, 1, -2]
+INTEGER (KIND=JPIM) :: ISIDE, I
+REAL (KIND=JPRM), POINTER :: ZZERO (:,:)
+#:for t, k, s in types
+#:for r in ranks
+${t}$ (KIND=${k}$), POINTER :: X_${s}$_${r}$ (${colons(r)}$)
+#:endfor
+#:endfor
+
+CALL TEST_SETUP ('test_types', YLALLOC, CLKIND, LLGPU)
+
+ISIDE = SIDE_LOWER
+#:for t, k, s in types
+#:for r in ranks
+CALL YLALLOC%ALLOCATE (X_${s}$_${r}$, IUB (1:${r}$), ILB (1:${r}$), KSIDE=ISIDE)
+ISIDE = SIDE_LOWER + SIDE_UPPER - ISIDE
+CALL CHECK (ALL (LBOUND (X_${s}$_${r}$) == ILB (1:${r}$)) .AND. ALL (UBOUND (X_${s}$_${r}$) == IUB (1:${r}$)), &
+          & 'bounds of ${t}$ (${k}$) rank ${r}$')
+X_${s}$_${r}$ = RESHAPE ([(${value(t, k)}$, I = 1, SIZE (X_${s}$_${r}$))], SHAPE (X_${s}$_${r}$))
+#:endfor
+#:endfor
+
+! A zero-size array in the middle of the stack
+CALL YLALLOC%ALLOCATE (ZZERO, [5, 0])
+CALL CHECK (SIZE (ZZERO) == 0, 'zero-size array')
+
+IF (LLGPU) THEN
+  ! Host -> device, clear the host copy, device -> host
+#:for t, k, s in types
+#:for r in ranks
+  !$ACC UPDATE DEVICE (X_${s}$_${r}$)
+#:if t == 'LOGICAL'
+  X_${s}$_${r}$ = .FALSE.
+#:else
+  X_${s}$_${r}$ = 0
+#:endif
+  !$ACC UPDATE HOST (X_${s}$_${r}$)
+#:endfor
+#:endfor
+ENDIF
+
+#:for t, k, s in types
+#:for r in ranks
+CALL CHECK (ALL (X_${s}$_${r}$ ${same(t)}$ RESHAPE ([(${value(t, k)}$, I = 1, SIZE (X_${s}$_${r}$))], &
+          & SHAPE (X_${s}$_${r}$))), 'values of ${t}$ (${k}$) rank ${r}$')
+#:endfor
+#:endfor
+
+CALL YLALLOC%DEALLOCATE (ZZERO)
+#:for t, k, s in reversed(types)
+#:for r in reversed(ranks)
+CALL YLALLOC%DEALLOCATE (X_${s}$_${r}$)
+CALL CHECK (.NOT. ASSOCIATED (X_${s}$_${r}$), 'pointer nullified')
+#:endfor
+#:endfor
+
+CALL TEST_END (YLALLOC)
+
+END PROGRAM TEST_TYPES

@@ -1,0 +1,292 @@
+MODULE STACK_CORE_MOD
+
+! Two-sided LIFO stack in one buffer of SIZE bytes, shared by DOUBLESTACK_* and FIXED_*:
+!
+!   offset 0                                                                    SIZE
+!   +------------------+---------------------------------------+-----------------+
+!   | lower side  -->  |                 free                  |  <-- upper side |
+!   +------------------+---------------------------------------+-----------------+
+!                      ILOW                                    IUP
+!
+! ALLOC_BYTES and FREE_BYTES do the bookkeeping (alignment, LIFO check per side, collision of
+! the sides, statistics, debug fill). The concrete classes provide the buffer and override:
+!   ENSURE (KLOW, KUP)       make [0, KLOW) and [KUP, SIZE) usable (VMM maps chunks); default: nothing
+!   FILL (KOFF, KBYTES)      debug fill of freed bytes; default: memset of the host buffer
+!   REPORT_EXTRA ()          text appended to the REPORT line; default: none
+
+USE ISO_C_BINDING
+USE ISO_FORTRAN_ENV, ONLY : OUTPUT_UNIT
+USE PARKIND1, ONLY : JPIM, JPIB
+USE ALLOCATOR_PARAMS_MOD, ONLY : ALLOC_ALIGNMENT, DEBUG_FILL_BYTE, SIDE_LOWER, SIDE_UPPER
+USE ALLOCATOR_BASE_MOD, ONLY : ALLOCATOR_BASE
+USE HOST_HELPERS_MOD, ONLY : HOST_MEMSET
+
+IMPLICIT NONE
+
+PRIVATE
+PUBLIC :: STACK_BASE, MIB
+
+#include "abor1.intfb.h"
+
+TYPE STACK_ENTRY
+  INTEGER (KIND=JPIB) :: IOFF = 0               ! offset of the array in the buffer
+  INTEGER (KIND=JPIB) :: INBYTES = 0            ! bytes taken on the stack (aligned)
+  LOGICAL :: LZERO = .FALSE.                    ! zero-size array
+END TYPE
+
+TYPE STACK_SIDE
+  TYPE (STACK_ENTRY), ALLOCATABLE :: YE (:)     ! live arrays, bottom to top
+  INTEGER (KIND=JPIM) :: N = 0
+END TYPE
+
+TYPE, ABSTRACT, EXTENDS (ALLOCATOR_BASE) :: STACK_BASE
+  INTEGER (KIND=C_INTPTR_T) :: IHOST = 0        ! host address of the buffer
+  INTEGER (KIND=JPIB) :: ISIZE = 0              ! buffer size, bytes
+  INTEGER (KIND=JPIB) :: ILOW = 0               ! first free byte of the lower side
+  INTEGER (KIND=JPIB) :: IUP = 0                ! first byte used by the upper side
+  TYPE (STACK_SIDE) :: YSIDE (0:1)
+  INTEGER (KIND=JPIB) :: IPEAK (0:1) = 0        ! peak per side
+  INTEGER (KIND=JPIB) :: IPEAKSUM = 0           ! peak of lower + upper
+  INTEGER (KIND=JPIB) :: INALLOC = 0            ! number of ALLOCATE calls
+CONTAINS
+  PROCEDURE :: ALLOC_BYTES => STACK_ALLOC_BYTES
+  PROCEDURE :: FREE_BYTES => STACK_FREE_BYTES
+  PROCEDURE :: REPORT => STACK_REPORT
+  PROCEDURE :: PEAK_USED => STACK_PEAK_USED
+  PROCEDURE :: ENSURE => STACK_ENSURE
+  PROCEDURE :: FILL => STACK_FILL
+  PROCEDURE :: REPORT_EXTRA => STACK_REPORT_EXTRA
+  PROCEDURE :: STACK_OPEN, STACK_CLOSE
+END TYPE STACK_BASE
+
+CONTAINS
+
+REAL FUNCTION MIB (KBYTES)
+
+INTEGER (KIND=JPIB), INTENT (IN) :: KBYTES
+
+MIB = REAL (KBYTES) / 1048576.
+
+END FUNCTION MIB
+
+SUBROUTINE STACK_OPEN (SELF, KHOST, KSIZE)
+
+! Called by INIT once the buffer exists: KSIZE bytes at host address KHOST, both aligned
+
+CLASS (STACK_BASE), INTENT (INOUT) :: SELF
+INTEGER (KIND=C_INTPTR_T), INTENT (IN) :: KHOST
+INTEGER (KIND=JPIB), INTENT (IN) :: KSIZE
+
+INTEGER :: J
+
+IF (MOD (KHOST, INT (ALLOC_ALIGNMENT, C_INTPTR_T)) /= 0 .OR. MOD (KSIZE, ALLOC_ALIGNMENT) /= 0) &
+  & CALL ABOR1 (TRIM (SELF%CNAME)//': buffer not aligned on ALLOC_ALIGNMENT')
+SELF%IHOST = KHOST
+SELF%ISIZE = KSIZE
+SELF%ILOW = 0
+SELF%IUP = KSIZE
+DO J = 0, 1
+  IF (.NOT. ALLOCATED (SELF%YSIDE (J)%YE)) ALLOCATE (SELF%YSIDE (J)%YE (64))
+  SELF%YSIDE (J)%N = 0
+ENDDO
+SELF%IPEAK = 0
+SELF%IPEAKSUM = 0
+SELF%INALLOC = 0
+SELF%LINIT = .TRUE.
+
+END SUBROUTINE STACK_OPEN
+
+SUBROUTINE STACK_CLOSE (SELF)
+
+! Called by DESTROY before the buffer is released: warn about live arrays (verbose), report
+
+CLASS (STACK_BASE), INTENT (INOUT) :: SELF
+
+INTEGER (KIND=JPIM) :: ILIVE
+
+ILIVE = SELF%YSIDE (0)%N + SELF%YSIDE (1)%N
+IF (ILIVE > 0 .AND. SELF%LVERBOSE) WRITE (OUTPUT_UNIT, '(A,A,I0,A)') TRIM (SELF%CNAME), &
+  & '%DESTROY: warning: ', ILIVE, ' array(s) still allocated; released anyway'
+CALL SELF%REPORT
+SELF%YSIDE (0)%N = 0
+SELF%YSIDE (1)%N = 0
+SELF%LINIT = .FALSE.
+
+END SUBROUTINE STACK_CLOSE
+
+FUNCTION STACK_ALLOC_BYTES (SELF, KBYTES, KSIDE, LDZERO) RESULT (KADDR)
+
+CLASS (STACK_BASE), INTENT (INOUT) :: SELF
+INTEGER (KIND=JPIB), INTENT (IN) :: KBYTES
+INTEGER (KIND=JPIM), INTENT (IN) :: KSIDE
+LOGICAL, INTENT (IN) :: LDZERO
+INTEGER (KIND=C_INTPTR_T) :: KADDR
+
+INTEGER (KIND=JPIB) :: INB, IOFF
+TYPE (STACK_ENTRY), ALLOCATABLE :: YLTMP (:)
+CHARACTER (LEN=512) :: CLMESS
+
+! A zero-size array takes ALLOC_ALIGNMENT bytes, so that it has an address of its own
+INB = (MAX (KBYTES, 1_JPIB) + ALLOC_ALIGNMENT - 1) / ALLOC_ALIGNMENT * ALLOC_ALIGNMENT
+
+IF (INB > SELF%IUP - SELF%ILOW) THEN
+  WRITE (CLMESS, '(A,A,I0,A,A,A,F0.1,A,F0.1,A,F0.1,A,F0.1,A)') TRIM (SELF%CNAME), '%ALLOCATE of ', &
+    & KBYTES, ' bytes on the ', SIDE_NAME (KSIDE), ' side: buffer full (lower side ', &
+    & MIB (SELF%ILOW), ' MiB, upper side ', MIB (SELF%ISIZE - SELF%IUP), ' MiB, free ', &
+    & MIB (SELF%IUP - SELF%ILOW), ' MiB, buffer ', MIB (SELF%ISIZE), ' MiB)'
+  CALL ABOR1 (TRIM (CLMESS))
+ENDIF
+
+IF (KSIDE == SIDE_LOWER) THEN
+  IOFF = SELF%ILOW
+  SELF%ILOW = SELF%ILOW + INB
+ELSE
+  SELF%IUP = SELF%IUP - INB
+  IOFF = SELF%IUP
+ENDIF
+CALL SELF%ENSURE (SELF%ILOW, SELF%IUP)
+
+ASSOCIATE (YS => SELF%YSIDE (KSIDE))
+  IF (YS%N == SIZE (YS%YE)) THEN
+    ALLOCATE (YLTMP (2 * SIZE (YS%YE)))
+    YLTMP (1:YS%N) = YS%YE (1:YS%N)
+    CALL MOVE_ALLOC (YLTMP, YS%YE)
+  ENDIF
+  YS%N = YS%N + 1
+  YS%YE (YS%N) = STACK_ENTRY (IOFF, INB, LDZERO)
+END ASSOCIATE
+
+SELF%IPEAK (SIDE_LOWER) = MAX (SELF%IPEAK (SIDE_LOWER), SELF%ILOW)
+SELF%IPEAK (SIDE_UPPER) = MAX (SELF%IPEAK (SIDE_UPPER), SELF%ISIZE - SELF%IUP)
+SELF%IPEAKSUM = MAX (SELF%IPEAKSUM, SELF%ILOW + SELF%ISIZE - SELF%IUP)
+SELF%INALLOC = SELF%INALLOC + 1
+KADDR = SELF%IHOST + INT (IOFF, C_INTPTR_T)
+
+IF (SELF%LVERBOSE) WRITE (OUTPUT_UNIT, '(A,A,I0,A,A,A,I0,A,Z0)') TRIM (SELF%CNAME), &
+  & '%ALLOCATE: ', KBYTES, ' bytes, ', SIDE_NAME (KSIDE), ' side, offset ', IOFF, ', host 0x', KADDR
+
+END FUNCTION STACK_ALLOC_BYTES
+
+SUBROUTINE STACK_FREE_BYTES (SELF, KADDR, LDZERO)
+
+CLASS (STACK_BASE), INTENT (INOUT) :: SELF
+INTEGER (KIND=C_INTPTR_T), INTENT (IN) :: KADDR
+LOGICAL, INTENT (IN) :: LDZERO
+
+INTEGER (KIND=JPIM) :: IS, J, K
+INTEGER (KIND=JPIB) :: IOFF
+TYPE (STACK_ENTRY) :: YLE
+CHARACTER (LEN=512) :: CLMESS
+
+IOFF = INT (KADDR - SELF%IHOST, JPIB)
+
+! The array must be the top of a side: current side first, then the other one. A zero-size array
+! has no reliable address: it matches a zero-size top.
+IS = -1
+DO K = 0, 1
+  J = MERGE (SELF%ISIDE, SIDE_LOWER + SIDE_UPPER - SELF%ISIDE, K == 0)
+  ASSOCIATE (YS => SELF%YSIDE (J))
+    IF (YS%N > 0) THEN
+      IF (LDZERO) THEN
+        IF (YS%YE (YS%N)%LZERO) IS = J
+      ELSEIF (.NOT. YS%YE (YS%N)%LZERO .AND. YS%YE (YS%N)%IOFF == IOFF) THEN
+        IS = J
+      ENDIF
+    ENDIF
+  END ASSOCIATE
+  IF (IS >= 0) EXIT
+ENDDO
+
+IF (IS < 0) THEN
+  IF (LDZERO) CALL ABOR1 (TRIM (SELF%CNAME)//'%DEALLOCATE of a zero-size array: LIFO violation &
+    &(no zero-size array on top of either side)')
+  DO J = 0, 1
+    DO K = 1, SELF%YSIDE (J)%N
+      IF (SELF%YSIDE (J)%YE (K)%IOFF == IOFF .AND. .NOT. SELF%YSIDE (J)%YE (K)%LZERO) THEN
+        WRITE (CLMESS, '(A,A,A,A,I0,A,I0,A,I0,A,I0,A)') TRIM (SELF%CNAME), '%DEALLOCATE: LIFO violation: &
+          &array on the ', SIDE_NAME (J), ' side at offset ', IOFF, ' (allocation ', K, ' of ', &
+          & SELF%YSIDE (J)%N, '), but the top of that side is at offset ', &
+          & SELF%YSIDE (J)%YE (SELF%YSIDE (J)%N)%IOFF, '; deallocate in reverse order of allocation'
+        CALL ABOR1 (TRIM (CLMESS))
+      ENDIF
+    ENDDO
+  ENDDO
+  WRITE (CLMESS, '(A,A,Z0,A)') TRIM (SELF%CNAME), '%DEALLOCATE: array at host address 0x', KADDR, &
+    & ' was not allocated by this allocator'
+  CALL ABOR1 (TRIM (CLMESS))
+ENDIF
+
+YLE = SELF%YSIDE (IS)%YE (SELF%YSIDE (IS)%N)
+SELF%YSIDE (IS)%N = SELF%YSIDE (IS)%N - 1
+IF (IS == SIDE_LOWER) THEN
+  SELF%ILOW = YLE%IOFF
+ELSE
+  SELF%IUP = YLE%IOFF + YLE%INBYTES
+ENDIF
+IF (SELF%LDEBUG) CALL SELF%FILL (YLE%IOFF, YLE%INBYTES)
+
+IF (SELF%LVERBOSE) WRITE (OUTPUT_UNIT, '(A,A,I0,A,A,A,I0)') TRIM (SELF%CNAME), &
+  & '%DEALLOCATE: ', YLE%INBYTES, ' bytes, ', SIDE_NAME (IS), ' side, offset ', YLE%IOFF
+
+END SUBROUTINE STACK_FREE_BYTES
+
+SUBROUTINE STACK_ENSURE (SELF, KLOW, KUP)
+
+CLASS (STACK_BASE), INTENT (INOUT) :: SELF
+INTEGER (KIND=JPIB), INTENT (IN) :: KLOW, KUP
+
+END SUBROUTINE STACK_ENSURE
+
+SUBROUTINE STACK_FILL (SELF, KOFF, KBYTES)
+
+CLASS (STACK_BASE), INTENT (INOUT) :: SELF
+INTEGER (KIND=JPIB), INTENT (IN) :: KOFF, KBYTES
+
+CALL HOST_MEMSET (SELF%IHOST + INT (KOFF, C_INTPTR_T), DEBUG_FILL_BYTE, KBYTES)
+
+END SUBROUTINE STACK_FILL
+
+FUNCTION STACK_REPORT_EXTRA (SELF) RESULT (CDTEXT)
+
+CLASS (STACK_BASE), INTENT (IN) :: SELF
+CHARACTER (LEN=:), ALLOCATABLE :: CDTEXT
+
+CDTEXT = ''
+
+END FUNCTION STACK_REPORT_EXTRA
+
+SUBROUTINE STACK_REPORT (SELF, KUNIT)
+
+CLASS (STACK_BASE), INTENT (IN) :: SELF
+INTEGER, INTENT (IN), OPTIONAL :: KUNIT
+
+INTEGER :: IUNIT
+
+IUNIT = OUTPUT_UNIT
+IF (PRESENT (KUNIT)) IUNIT = KUNIT
+WRITE (IUNIT, '(A,A,F0.1,A,F0.1,A,F0.1,A,F0.1,A,I0,A,A)') TRIM (SELF%CNAME), ': buffer ', &
+  & MIB (SELF%ISIZE), ' MiB; peak used: lower ', MIB (SELF%IPEAK (SIDE_LOWER)), ' MiB, upper ', &
+  & MIB (SELF%IPEAK (SIDE_UPPER)), ' MiB, lower+upper ', MIB (SELF%IPEAKSUM), ' MiB; ', &
+  & SELF%INALLOC, ' allocations', SELF%REPORT_EXTRA ()
+
+END SUBROUTINE STACK_REPORT
+
+FUNCTION STACK_PEAK_USED (SELF) RESULT (KBYTES)
+
+CLASS (STACK_BASE), INTENT (IN) :: SELF
+INTEGER (KIND=JPIB) :: KBYTES
+
+KBYTES = SELF%IPEAKSUM
+
+END FUNCTION STACK_PEAK_USED
+
+FUNCTION SIDE_NAME (KSIDE) RESULT (CDNAME)
+
+INTEGER (KIND=JPIM), INTENT (IN) :: KSIDE
+CHARACTER (LEN=5) :: CDNAME
+
+CDNAME = MERGE ('lower', 'upper', KSIDE == SIDE_LOWER)
+
+END FUNCTION SIDE_NAME
+
+END MODULE STACK_CORE_MOD

@@ -1,0 +1,218 @@
+#:set ranks = [1, 2, 3, 4, 5]
+#:set types = [('INTEGER', 'JPIM', 'IM'), ('INTEGER', 'JPIB', 'IB'), ('REAL', 'JPRM', 'RM'), ('REAL', 'JPRD', 'RD'), ('LOGICAL', 'JPLM', 'LM')]
+#:def colons(r)
+${','.join([':'] * r)}$
+#:enddef
+#:def remap(r)
+${','.join(['ILB(%d):UBOUNDS(%d)' % (i, i) for i in range(1, r + 1)])}$
+#:enddef
+MODULE ALLOCATOR_BASE_MOD
+
+! Abstract base class of all the allocators.
+!
+!   CALL YDALLOC%INIT (KSIZE [, LDDEBUG] [, LDVERBOSE])       "constructor"; KSIZE in bytes
+!   CALL YDALLOC%ALLOCATE (X, UBOUNDS [, LBOUNDS] [, KSIDE])  X: POINTER array, rank 1 to 5, of
+!   CALL YDALLOC%DEALLOCATE (X)                               INTEGER (JPIM, JPIB), REAL (JPRM,
+!                                                             JPRD) or LOGICAL (JPLM)
+!   CALL YDALLOC%SET_SIDE (KSIDE), CALL YDALLOC%NEXT_SIDE     current side (double stacks)
+!   CALL YDALLOC%REPORT ([KUNIT])                             one line of statistics
+!   YDALLOC%PEAK_USED ()                                      peak of the memory in use, bytes
+!   CALL YDALLOC%DESTROY                                      "destructor"; prints the report
+!
+! The typed ALLOCATE/DEALLOCATE are written once here: they compute the size in bytes and call two
+! deferred byte-level methods, ALLOC_BYTES and FREE_BYTES, which every allocator implements. The
+! address returned by ALLOC_BYTES is a host address; for the GPU allocators, the host range is
+! mapped to device memory (OpenACC), so that PRESENT (X) finds the device copy.
+
+USE ISO_C_BINDING
+USE PARKIND1, ONLY : JPIM, JPIB, JPRM, JPRD, JPLM
+USE ALLOCATOR_PARAMS_MOD, ONLY : SIDE_LOWER, SIDE_UPPER
+
+IMPLICIT NONE
+
+PRIVATE
+PUBLIC :: ALLOCATOR_BASE, SIDE_LOWER, SIDE_UPPER
+
+#include "abor1.intfb.h"
+
+TYPE, ABSTRACT :: ALLOCATOR_BASE
+  CHARACTER (LEN=32) :: CNAME = ''              ! e.g. DOUBLESTACK_GPU, for the messages
+  LOGICAL :: LINIT = .FALSE.                    ! INIT done, DESTROY not done
+  LOGICAL :: LDEBUG = .FALSE.                   ! fill freed memory (stack-based allocators)
+  LOGICAL :: LVERBOSE = .FALSE.                 ! print what the allocator does
+  INTEGER (KIND=JPIM) :: ISIDE = SIDE_LOWER     ! current side
+CONTAINS
+  PROCEDURE (INIT_IF),        DEFERRED :: INIT
+  PROCEDURE (DESTROY_IF),     DEFERRED :: DESTROY
+  PROCEDURE (REPORT_IF),      DEFERRED :: REPORT
+  PROCEDURE (ALLOC_BYTES_IF), DEFERRED :: ALLOC_BYTES
+  PROCEDURE (FREE_BYTES_IF),  DEFERRED :: FREE_BYTES
+  PROCEDURE (PEAK_USED_IF),   DEFERRED :: PEAK_USED
+  PROCEDURE :: SET_SIDE, NEXT_SIDE, GET_SIDE
+  PROCEDURE :: SET_OPTIONS
+#:for t, k, s in types
+#:for r in ranks
+  PROCEDURE, PRIVATE :: ALLOCATE_${s}$_${r}$, DEALLOCATE_${s}$_${r}$
+#:endfor
+#:endfor
+  GENERIC :: ALLOCATE => &
+#:for t, k, s in types
+#:for r in ranks
+    & ALLOCATE_${s}$_${r}$${'' if (t, k, s) == types[-1] and r == ranks[-1] else ', &'}$
+#:endfor
+#:endfor
+  GENERIC :: DEALLOCATE => &
+#:for t, k, s in types
+#:for r in ranks
+    & DEALLOCATE_${s}$_${r}$${'' if (t, k, s) == types[-1] and r == ranks[-1] else ', &'}$
+#:endfor
+#:endfor
+END TYPE ALLOCATOR_BASE
+
+ABSTRACT INTERFACE
+
+SUBROUTINE INIT_IF (SELF, KSIZE, LDDEBUG, LDVERBOSE)
+  IMPORT
+  CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+  INTEGER (KIND=JPIB), INTENT (IN) :: KSIZE
+  LOGICAL, INTENT (IN), OPTIONAL :: LDDEBUG, LDVERBOSE
+END SUBROUTINE
+
+SUBROUTINE DESTROY_IF (SELF)
+  IMPORT
+  CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+END SUBROUTINE
+
+SUBROUTINE REPORT_IF (SELF, KUNIT)
+  IMPORT
+  CLASS (ALLOCATOR_BASE), INTENT (IN) :: SELF
+  INTEGER, INTENT (IN), OPTIONAL :: KUNIT
+END SUBROUTINE
+
+! Reserve KBYTES (0 for a zero-size array, LDZERO true) on side KSIDE; return the host address
+FUNCTION ALLOC_BYTES_IF (SELF, KBYTES, KSIDE, LDZERO) RESULT (KADDR)
+  IMPORT
+  CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+  INTEGER (KIND=JPIB), INTENT (IN) :: KBYTES
+  INTEGER (KIND=JPIM), INTENT (IN) :: KSIDE
+  LOGICAL, INTENT (IN) :: LDZERO
+  INTEGER (KIND=C_INTPTR_T) :: KADDR
+END FUNCTION
+
+! Release the array at host address KADDR (meaningless for a zero-size array, LDZERO true)
+SUBROUTINE FREE_BYTES_IF (SELF, KADDR, LDZERO)
+  IMPORT
+  CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+  INTEGER (KIND=C_INTPTR_T), INTENT (IN) :: KADDR
+  LOGICAL, INTENT (IN) :: LDZERO
+END SUBROUTINE
+
+! Peak of the memory in use, bytes (lower + upper side for the double stacks)
+FUNCTION PEAK_USED_IF (SELF) RESULT (KBYTES)
+  IMPORT
+  CLASS (ALLOCATOR_BASE), INTENT (IN) :: SELF
+  INTEGER (KIND=JPIB) :: KBYTES
+END FUNCTION
+
+END INTERFACE
+
+CONTAINS
+
+SUBROUTINE SET_OPTIONS (SELF, CDNAME, LDDEBUG, LDVERBOSE)
+
+! For the INIT of the concrete classes: name and options; abort if already initialised
+
+CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+CHARACTER (LEN=*), INTENT (IN) :: CDNAME
+LOGICAL, INTENT (IN), OPTIONAL :: LDDEBUG, LDVERBOSE
+
+IF (SELF%LINIT) CALL ABOR1 (CDNAME//'%INIT: already initialised; call DESTROY first')
+SELF%CNAME = CDNAME
+SELF%LDEBUG = .FALSE.
+IF (PRESENT (LDDEBUG)) SELF%LDEBUG = LDDEBUG
+SELF%LVERBOSE = .FALSE.
+IF (PRESENT (LDVERBOSE)) SELF%LVERBOSE = LDVERBOSE
+SELF%ISIDE = SIDE_LOWER
+
+END SUBROUTINE SET_OPTIONS
+
+SUBROUTINE SET_SIDE (SELF, KSIDE)
+
+CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+INTEGER (KIND=JPIM), INTENT (IN) :: KSIDE
+
+IF (KSIDE /= SIDE_LOWER .AND. KSIDE /= SIDE_UPPER) &
+  & CALL ABOR1 (TRIM (SELF%CNAME)//'%SET_SIDE: KSIDE must be SIDE_LOWER or SIDE_UPPER')
+SELF%ISIDE = KSIDE
+
+END SUBROUTINE SET_SIDE
+
+SUBROUTINE NEXT_SIDE (SELF)
+
+CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+
+SELF%ISIDE = SIDE_LOWER + SIDE_UPPER - SELF%ISIDE
+
+END SUBROUTINE NEXT_SIDE
+
+FUNCTION GET_SIDE (SELF) RESULT (KSIDE)
+
+CLASS (ALLOCATOR_BASE), INTENT (IN) :: SELF
+INTEGER (KIND=JPIM) :: KSIDE
+
+KSIDE = SELF%ISIDE
+
+END FUNCTION GET_SIDE
+
+#:for t, k, s in types
+#:for r in ranks
+SUBROUTINE ALLOCATE_${s}$_${r}$ (SELF, X, UBOUNDS, LBOUNDS, KSIDE)
+
+CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+${t}$ (KIND=${k}$), POINTER, INTENT (INOUT) :: X (${colons(r)}$)
+INTEGER (KIND=JPIM), INTENT (IN) :: UBOUNDS (${r}$)
+INTEGER (KIND=JPIM), INTENT (IN), OPTIONAL :: LBOUNDS (${r}$)
+INTEGER (KIND=JPIM), INTENT (IN), OPTIONAL :: KSIDE
+
+${t}$ (KIND=${k}$), POINTER :: ZFLAT (:)
+${t}$ (KIND=${k}$) :: ZDUM
+INTEGER (KIND=JPIM) :: ILB (${r}$), ISIDE
+INTEGER (KIND=JPIB) :: INELEM
+INTEGER (KIND=C_INTPTR_T) :: IADDR
+
+IF (.NOT. SELF%LINIT) CALL ABOR1 ('ALLOCATE: allocator not initialised (call INIT first)')
+ILB = 1
+IF (PRESENT (LBOUNDS)) ILB = LBOUNDS
+ISIDE = SELF%ISIDE
+IF (PRESENT (KSIDE)) ISIDE = KSIDE
+IF (ISIDE /= SIDE_LOWER .AND. ISIDE /= SIDE_UPPER) &
+  & CALL ABOR1 (TRIM (SELF%CNAME)//'%ALLOCATE: KSIDE must be SIDE_LOWER or SIDE_UPPER')
+
+INELEM = PRODUCT (MAX (INT (UBOUNDS, JPIB) - INT (ILB, JPIB) + 1_JPIB, 0_JPIB))
+IADDR = SELF%ALLOC_BYTES (INELEM * INT (STORAGE_SIZE (ZDUM) / 8, JPIB), ISIDE, INELEM == 0)
+CALL C_F_POINTER (TRANSFER (IADDR, C_NULL_PTR), ZFLAT, [INELEM])
+X (${remap(r)}$) => ZFLAT
+
+END SUBROUTINE ALLOCATE_${s}$_${r}$
+
+SUBROUTINE DEALLOCATE_${s}$_${r}$ (SELF, X)
+
+CLASS (ALLOCATOR_BASE), INTENT (INOUT) :: SELF
+${t}$ (KIND=${k}$), POINTER, INTENT (INOUT) :: X (${colons(r)}$)
+
+INTEGER (KIND=C_INTPTR_T) :: IADDR
+LOGICAL :: LLZERO
+
+IF (.NOT. SELF%LINIT) CALL ABOR1 ('DEALLOCATE: allocator not initialised')
+IF (.NOT. ASSOCIATED (X)) CALL ABOR1 (TRIM (SELF%CNAME)//'%DEALLOCATE: array not associated')
+LLZERO = SIZE (X, KIND=JPIB) == 0
+IADDR = 0
+IF (.NOT. LLZERO) IADDR = TRANSFER (C_LOC (X), IADDR)
+CALL SELF%FREE_BYTES (IADDR, LLZERO)
+NULLIFY (X)
+
+END SUBROUTINE DEALLOCATE_${s}$_${r}$
+
+#:endfor
+#:endfor
+END MODULE ALLOCATOR_BASE_MOD
